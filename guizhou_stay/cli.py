@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
 from pydantic import ValidationError
 
-from guizhou_stay import bundles, catalog, collector, crawl, verification
+from guizhou_stay import bundles, catalog, collector, crawl, quota, scheduler, verification
 from guizhou_stay.contracts import Page, SessionOpen
 from guizhou_stay.errors import DomainError, conflict
 from guizhou_stay.portal import FolderReader
+from guizhou_stay.replay import ScriptedReader
 from guizhou_stay.storage import Store
 
 
@@ -67,6 +69,61 @@ def verify(_store, args):
     return bundles.verify(raw)
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def provision_quota(store, args):
+    if args.pages is None or not args.restored_at:
+        raise DomainError(422, "quota_input", "登记额度需要 --pages 与 --restored-at")
+    restored_at = datetime.fromisoformat(args.restored_at)
+    if restored_at.tzinfo is None:
+        raise DomainError(422, "quota_input", "恢复时刻必须带时区")
+    body = quota.QuotaAllowance(source=args.source, read_pages=args.pages,
+                                restored_at=restored_at)
+    with store.transaction(write=True) as db:
+        return quota.provision(db, body, at=_now())
+
+
+def quota_status(store, args):
+    from guizhou_stay.quota import utc
+
+    with store.transaction(write=True) as db:
+        return quota.status(db, args.source, at=utc(_now()))
+
+
+def register_job(store, args):
+    body = scheduler.NewJob(
+        job_id=args.job, source=args.source, query=args.query,
+        necessity=args.necessity, plan_id=args.plan, slot=args.slot,
+    )
+    return scheduler.register_job(store, body, at=_now())
+
+
+def pause_job(store, args):
+    body = scheduler.JobPause(paused=args.paused, reason=args.reason)
+    return scheduler.set_paused(store, args.job, body, at=_now())
+
+
+def board(store, args):
+    from guizhou_stay.quota import utc
+
+    return scheduler.board(store, at=utc(_now()))
+
+
+def schedule_run(store, args):
+    directory = args.directory.resolve()
+    reader = ScriptedReader(directory)
+    from guizhou_stay.quota import utc
+
+    return scheduler.run_once(store, reader, at=utc(_now()))
+
+
+def lateness(store, args):
+    return scheduler.lateness_impact(
+        store, args.plan, deadline=datetime.fromisoformat(args.deadline))
+
+
 def parser():
     value = argparse.ArgumentParser(prog="python -m guizhou_stay.cli")
     value.add_argument("--db", type=Path)
@@ -104,6 +161,43 @@ def parser():
     check = commands.add_parser("verify-bundle", help="独立核对供给包与页面摘要")
     check.add_argument("archive", type=Path)
     check.set_defaults(handle=verify)
+
+    quota_cmd = commands.add_parser("quota", help="登记或查看共享来源读页额度")
+    quota_cmd.add_argument("source")
+    quota_cmd.add_argument("--pages", type=int)
+    quota_cmd.add_argument("--restored-at", dest="restored_at")
+    quota_cmd.set_defaults(handle=provision_quota)
+
+    quota_view = commands.add_parser("quota-status", help="查看来源额度与恢复时刻")
+    quota_view.add_argument("source")
+    quota_view.set_defaults(handle=quota_status)
+
+    job_cmd = commands.add_parser("schedule-job", help="登记多作业调度采集任务")
+    job_cmd.add_argument("job")
+    job_cmd.add_argument("source")
+    job_cmd.add_argument("query")
+    job_cmd.add_argument("--necessity", choices=("required", "optional"), default="required")
+    job_cmd.add_argument("--plan")
+    job_cmd.add_argument("--slot")
+    job_cmd.set_defaults(handle=register_job)
+
+    pause_cmd = commands.add_parser("schedule-pause", help="暂缓或恢复可选采集任务")
+    pause_cmd.add_argument("job")
+    pause_cmd.add_argument("--paused", type=lambda v: v in {"1", "true", "yes"}, default=True)
+    pause_cmd.add_argument("--reason")
+    pause_cmd.set_defaults(handle=pause_job)
+
+    board_cmd = commands.add_parser("schedule-board", help="查看调度台阻塞原因与评分")
+    board_cmd.set_defaults(handle=board)
+
+    run_cmd = commands.add_parser("schedule-run", help="按调度策略对回放目录执行一轮采集")
+    run_cmd.add_argument("directory", type=Path)
+    run_cmd.set_defaults(handle=schedule_run)
+
+    late_cmd = commands.add_parser("lateness", help="查询必采迟到对当前证据的影响")
+    late_cmd.add_argument("plan")
+    late_cmd.add_argument("deadline")
+    late_cmd.set_defaults(handle=lateness)
     return value
 
 

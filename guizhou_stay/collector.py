@@ -48,28 +48,73 @@ def check_collection(db, session_id):
     return row
 
 
-def register(store: Store, session_id: str, source_label: str, reader: Reader) -> dict:
-    with store.transaction() as db:
-        existing = db.execute("SELECT * FROM collections WHERE session_id=?", (session_id,)).fetchone()
+def register(store: Store, session_id: str, source_label: str, reader: Reader,
+             db=None) -> dict:
+    if db is not None:
+        return _register(db, session_id, source_label, reader)
+    with store.transaction() as read_db:
+        existing = read_db.execute(
+            "SELECT * FROM collections WHERE session_id=?", (session_id,)).fetchone()
         if existing is not None:
             if existing["source_label"] != source_label:
                 raise conflict("reader_changed", "恢复时需使用原回放来源")
-            return progress(db, session_id)
-    html, url = reader.read(None)
-    capture = convert(session_id, html, url)
-    opened = session_from_first(session_id, capture)
-    with store.transaction(write=True) as db:
-        existing = db.execute("SELECT * FROM collections WHERE session_id=?", (session_id,)).fetchone()
-        if existing is None:
-            if db.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone():
-                raise conflict("manual_session", "此编号已用于人工提交")
-            crawl.open_session(db, opened)
-            db.execute("INSERT INTO collections(session_id,source_label) VALUES (?,?)",
-                       (session_id, source_label))
-            return commit_page(db, capture, at=utc())
+            return progress(read_db, session_id)
+    with store.transaction(write=True) as write_db:
+        return _register(write_db, session_id, source_label, reader)
+
+
+def _read_html(reader, cursor):
+    """读取原始页面，兼容纯 Reader（返回二元组）与脚本化读取器（返回 ReadResult）。"""
+    result = reader.read(cursor)
+    if isinstance(result, tuple):
+        return result
+    return result.html, result.url
+
+
+def _register(db, session_id: str, source_label: str, reader: Reader) -> dict:
+    existing = db.execute("SELECT * FROM collections WHERE session_id=?",
+                          (session_id,)).fetchone()
+    if existing is not None:
         if existing["source_label"] != source_label:
             raise conflict("reader_changed", "恢复时需使用原回放来源")
         return progress(db, session_id)
+    html, url = _read_html(reader, None)
+    capture = convert(session_id, html, url)
+    opened = session_from_first(session_id, capture)
+    if db.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone():
+        raise conflict("manual_session", "此编号已用于人工提交")
+    crawl.open_session(db, opened)
+    db.execute("INSERT INTO collections(session_id,source_label) VALUES (?,?)",
+               (session_id, source_label))
+    return commit_page(db, capture, at=utc())
+
+
+def open_collection(db, session_id: str, source_label: str, reader: Reader, *,
+                    at: datetime | None = None) -> dict:
+    """只登记采集会话而不读取首页，首页由后续领取按额度读取。
+
+    调度台用它把首次实际读取也纳入共享额度预留；原单会话 ``register`` 入口
+    仍保持“登记即读首页”的行为不变。
+    """
+    existing = db.execute("SELECT * FROM collections WHERE session_id=?",
+                          (session_id,)).fetchone()
+    if existing is not None:
+        if existing["source_label"] != source_label:
+            raise conflict("reader_changed", "恢复时需使用原回放来源")
+        return progress(db, session_id)
+    if db.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone():
+        raise conflict("manual_session", "此编号已用于人工提交")
+    # 仅用首页元数据开启会话边界，不保留页面内容，不计入已读页。
+    html, url = _read_html(reader, None)
+    opened = session_from_first(session_id, convert(session_id, html, url))
+    crawl.open_session(db, opened)
+    db.execute(
+        "INSERT INTO collections(session_id,source_label,next_page,cursor) VALUES(?,?,1,NULL)",
+        (session_id, source_label),
+    )
+    record_event(db, session_id, 1, "session_opened",
+                 {"source_label": source_label}, at=at or utc())
+    return progress(db, session_id)
 
 
 def claim_next(store: Store, session_id: str, at: datetime) -> Claim | None:

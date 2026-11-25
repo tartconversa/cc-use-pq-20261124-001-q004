@@ -52,8 +52,9 @@ class ApiCase(unittest.TestCase):
         self.client = TestClient(create_app(Path(self.temp.name) / "stay.sqlite3"))
         self.addCleanup(self.client.close)
 
-    def call(self, method, path, data=None, *, status=200, params=None):
-        response = self.client.request(method, path, json=data, params=params)
+    def call(self, method, path, data=None, *, status=200, params=None, headers=None):
+        response = self.client.request(method, path, json=data, params=params,
+                                       headers=headers or {})
         self.assertEqual(response.status_code, status, response.text)
         return response.json()
 

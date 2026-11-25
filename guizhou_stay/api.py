@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 import json
 import os
@@ -9,21 +9,33 @@ from pathlib import Path
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
-from guizhou_stay import bundles, catalog, collector, coverage, crawl, exporter, filters, handoff, plans, provenance, reconcile, verification
+from guizhou_stay import bundles, catalog, collector, coverage, crawl, exporter, filters, handoff, plans, provenance, quota, reconcile, scheduler, verification
 from guizhou_stay.contracts import CoveragePolicy, Evidence, Page, PublishRequest, SessionOpen
 from guizhou_stay.digest import digest
 from guizhou_stay.errors import DomainError, conflict, missing
 from guizhou_stay.portal import LoopbackReader
+from guizhou_stay.replay import ScriptedReader
 from guizhou_stay.storage import Store
 
 
 def create_app(database: str | Path) -> FastAPI:
     store = Store(database)
-    app = FastAPI(title="黔居采集台", version="1.0.0")
+    app = FastAPI(title="黔居采集台", version="1.1.0")
 
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, exc: DomainError):
         return JSONResponse(status_code=exc.status, content=exc.payload())
+
+    def clock(request: Request | None = None) -> datetime:
+        from guizhou_stay.quota import utc
+
+        # 本地回放可通过 X-Stay-Clock 头固定决策时刻，便于确定性演练；
+        # 缺省使用真实当前时刻。
+        if request is not None:
+            pinned = request.headers.get("x-stay-clock")
+            if pinned:
+                return utc(datetime.fromisoformat(pinned))
+        return utc(datetime.now(timezone.utc))
 
     @app.get("/health")
     def health():
@@ -212,6 +224,69 @@ def create_app(database: str | Path) -> FastAPI:
     def delivery_content(destination: str, delivery_id: str):
         with store.transaction() as db:
             return handoff.package_for_delivery(db, destination, delivery_id)
+
+    # 共享来源读页额度账本
+    @app.put("/quota/{source}")
+    def provision_quota(source: str, body: quota.QuotaAllowance, request: Request):
+        if body.source != source:
+            raise missing("source_quota", source)
+        with store.transaction(write=True) as db:
+            return quota.provision(db, body, at=clock(request))
+
+    @app.get("/quota/{source}")
+    def quota_status(source: str, request: Request):
+        with store.transaction(write=True) as db:
+            return quota.status(db, source, at=clock(request))
+
+    @app.post("/quota/{source}/receipts")
+    def quota_receipt(source: str, body: quota.QuotaReceipt, request: Request):
+        if body.source != source:
+            raise missing("source_quota", source)
+        with store.transaction(write=True) as db:
+            return quota.apply_receipt(db, body, at=clock(request))
+
+    @app.get("/quota/{source}/receipts")
+    def quota_receipts(source: str):
+        with store.transaction() as db:
+            return {"items": quota.receipts(db, source)}
+
+    @app.post("/quota/{source}/cursors")
+    def cursor_notice(source: str, body: quota.CursorNotice, request: Request):
+        if body.source != source:
+            raise missing("source_quota", source)
+        with store.transaction(write=True) as db:
+            return quota.record_cursor_notice(db, body, at=clock(request))
+
+    # 多作业调度台（本地回放，保留原单会话 /collections 调用）
+    @app.post("/schedule/jobs")
+    def create_job(body: scheduler.NewJob, request: Request):
+        return scheduler.register_job(store, body, at=clock(request))
+
+    @app.get("/schedule/jobs/{job_id}")
+    def get_job(job_id: str):
+        return scheduler.read_job(store, job_id)
+
+    @app.post("/schedule/jobs/{job_id}/pause")
+    def pause_job(job_id: str, body: scheduler.JobPause, request: Request):
+        return scheduler.set_paused(store, job_id, body, at=clock(request))
+
+    @app.get("/schedule/board")
+    def schedule_board(request: Request):
+        return scheduler.board(store, at=clock(request))
+
+    @app.get("/schedule/events")
+    def schedule_events(job_id: str | None = Query(default=None),
+                        limit: int = Query(default=100, ge=1, le=500)):
+        return {"items": scheduler.events(store, job_id=job_id, limit=limit)}
+
+    @app.post("/schedule/run")
+    def schedule_run(request: Request, directory: str = Query(min_length=1, max_length=4096)):
+        reader = ScriptedReader(Path(directory))
+        return scheduler.run_once(store, reader, at=clock(request))
+
+    @app.get("/plans/{plan_id}/lateness")
+    def plan_lateness(plan_id: str, deadline: datetime):
+        return scheduler.lateness_impact(store, plan_id, deadline=deadline)
 
     return app
 

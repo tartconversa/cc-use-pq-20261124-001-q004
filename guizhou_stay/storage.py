@@ -99,6 +99,41 @@ CREATE INDEX IF NOT EXISTS supply_region ON supplies(source_revision);
 CREATE INDEX IF NOT EXISTS staged_duplicates ON staged(session_id,item_id,page_no);
 CREATE INDEX IF NOT EXISTS proof_version ON evidence(source,supply_id,category,source_revision);
 CREATE INDEX IF NOT EXISTS collection_history ON capture_events(session_id,seq);
+CREATE TABLE IF NOT EXISTS source_quotas(
+ source TEXT PRIMARY KEY, read_pages INTEGER NOT NULL, remaining INTEGER NOT NULL,
+ restored_at TEXT NOT NULL, state_version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quota_receipts(
+ receipt_id TEXT PRIMARY KEY, source TEXT NOT NULL, read_id TEXT NOT NULL,
+ outcome TEXT NOT NULL CHECK(outcome IN ('success','partial_failure','failure')),
+ charged_pages INTEGER NOT NULL, restored_at TEXT NOT NULL, remaining INTEGER NOT NULL,
+ state_version INTEGER NOT NULL, received_at TEXT NOT NULL, detail TEXT NOT NULL,
+ UNIQUE(source,read_id)
+);
+CREATE TABLE IF NOT EXISTS source_cursors(
+ source TEXT NOT NULL, cursor TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('live','expired')),
+ expires_at TEXT NOT NULL, observed_at TEXT NOT NULL, detail TEXT NOT NULL,
+ scope_session TEXT, superseded INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(source,cursor)
+);
+CREATE TABLE IF NOT EXISTS collection_jobs(
+ job_id TEXT PRIMARY KEY, plan_id TEXT, slot TEXT, source TEXT NOT NULL, query TEXT NOT NULL,
+ locale TEXT NOT NULL, necessity TEXT NOT NULL CHECK(necessity IN ('required','optional')),
+ state TEXT NOT NULL CHECK(state IN ('active','paused','done','abandoned')),
+ priority INTEGER NOT NULL DEFAULT 100, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ first_scheduled_at TEXT, last_scheduled_at TEXT, times_blocked INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS job_sessions(
+ job_id TEXT NOT NULL, session_id TEXT NOT NULL, generation INTEGER NOT NULL,
+ started_at TEXT NOT NULL, ended_at TEXT, end_reason TEXT,
+ PRIMARY KEY(job_id,session_id)
+);
+CREATE TABLE IF NOT EXISTS schedule_events(
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, source TEXT NOT NULL,
+ reason TEXT NOT NULL, detail TEXT NOT NULL, observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS schedule_job_history ON schedule_events(job_id,seq);
+CREATE INDEX IF NOT EXISTS job_sessions_lookup ON job_sessions(job_id,generation);
 """
 
 

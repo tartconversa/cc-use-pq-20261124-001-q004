@@ -31,6 +31,40 @@ python -m guizhou_stay.cli --db demo.sqlite3 audit demo-capture
 
 人工已经取得的结构化页面可以通过 `POST /sessions` 和 `POST /sessions/{session_id}/pages` 追加。页码及游标必须连续，新会话从第一页开始。人工记录也保存摘要，导出包会明确标识它只有结构化凭证。
 
+## 多作业调度与共享额度
+
+三组运营人员可能轮流采集同一合作方。合作方在本地演练接口上以**共享来源**为单位扣减实际读页额度，额度有恢复时刻；成功和部分失败的读取都返回额度回执。调度台在多份未完成采集之间安排下一次访问，原单会话入口 `POST /collections/{session_id}` 与 `cli collect` 保持不变。
+
+额度账本（`/quota/{source}`）的规则：
+
+- 每次实际读取先做额度预留并绑定读取编号；在收到对应回执前，该读取不会释放给其他进程。
+- 回执按 `(source, read_id)` 幂等，重送同一回执返回原记录，不重复扣减也不重复增加可用额度。
+- 恢复时刻对所有工作进程一致，未到时刻不得透支；到达时刻后整轮预算自动恢复，合作方状态版本号同步推进。
+- 回执带 `state_version`，较早一轮的回执不能覆盖更新的来源状态（`receipt_stale`）。
+
+调度台（`/schedule`）把三类等待原因明确区分，互不混用：
+
+| 原因 | 含义 | 处置 |
+| --- | --- | --- |
+| `quota_waiting` | 来源额度用尽，等待统一恢复时刻 | 阻塞到 `next_recovery` |
+| `cursor_expired` | 合作方明确通知游标过期，旧页不能直接续补 | 保留旧会话现场，另开新会话从第一页重采 |
+| `source_revision` | 来源修订、查询或语言等范围变化 | 终止旧会话，另开新会话重采，已吸收事实保留 |
+
+仍可接续的查询获得游标保护加分，优先于反复重新开始的快查询；长期排在后面的可选（常规补采）作业按等待时长与阻塞次数老化，得到合理的超车机会。运营可通过 `/schedule/jobs/{id}/pause` 暂缓可选任务（必采任务不可暂缓），暂缓不会抹掉已经吸收的页面事实。
+
+`GET /plans/{plan_id}/lateness?deadline=...` 供计划人员核对：本轮必采查询若在截止时刻前未完成，会列出哪些槽未采全、哪些已选会话超过采集时效、哪些引用证明显著到期；未采全的会话永远不能分配给必采槽，部分结果不充当足够覆盖。
+
+本地回放目录在原有 `first.html`、游标页之外可放置 `scenario.json`，编排读页额度、恢复时刻、瞬时失败（`fail_on`）、游标通知（`notices`/`cursor_expiry`）和来源修订替换（`revision_swaps`）。HTTP 回放可带 `X-Stay-Clock` 头固定决策时刻，便于确定性演练。
+
+```text
+python -m guizhou_stay.cli --db demo.sqlite3 quota partner-map --pages 2 --restored-at 2030-01-01T00:00:00+00:00
+python -m guizhou_stay.cli --db demo.sqlite3 schedule-job job-a partner-map 贵州旅居
+python -m guizhou_stay.cli --db demo.sqlite3 schedule-board
+python -m guizhou_stay.cli --db demo.sqlite3 schedule-run fixtures/partner
+python -m guizhou_stay.cli --db demo.sqlite3 schedule-pause job-a --reason 运营确认暂缓
+python -m guizhou_stay.cli --db demo.sqlite3 lateness hk-catalog 2030-01-01T00:00:00+00:00
+```
+
 ## 选用证据并交接
 
 目录在整个会话齐全后更新。身份按类型、提供方、标题、城市和地区归并。不同合作方若上报同一身份但在关键字段上相互冲突，覆盖评估会显示分歧及相关来源，冲突项会阻止当前类别通过。证明按来源、项目编号、类别及来源修订绑定，有效期起点包含、终点不包含。查询时间必须包含时区。
